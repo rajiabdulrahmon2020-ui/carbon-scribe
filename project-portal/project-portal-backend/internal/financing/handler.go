@@ -1,12 +1,14 @@
 package financing
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"carbon-scribe/project-portal/project-portal-backend/internal/financing/tokenization"
 	"carbon-scribe/project-portal/project-portal-backend/internal/middleware"
 
 	"github.com/gin-gonic/gin"
@@ -50,8 +52,11 @@ func (h *Handler) RegisterRoutes(v1 *gin.RouterGroup) {
 			financing.POST("/payments/initiate", requirePermission("financing:pay"), h.initiatePayment)
 		}
 
+		financing.POST("/trustlines", requirePermission("financing:pay"), h.buildTrustlineTransaction)
+
 		financing.POST("/payouts/distribute", requirePermission("financing:distribute"), h.distributeRevenue)
 		financing.GET("/payouts/:id", requirePermission("financing:read"), h.getPayoutStatus)
+		financing.POST("/payouts/:id/retry", requirePermission("financing:distribute"), h.retryDistributionPayout)
 	}
 
 	// Traceability and Methodology routes (registered on v1 for specific structure)
@@ -188,6 +193,10 @@ func (h *Handler) mintCredits(c *gin.Context) {
 	}
 	credit, err := h.service.MintCredits(c.Request.Context(), req)
 	if err != nil {
+		if errors.Is(err, tokenization.ErrTrustlineMissing) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "reason": "trustline_missing"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -298,6 +307,24 @@ func (h *Handler) initiatePayment(c *gin.Context) {
 	c.JSON(http.StatusCreated, payment)
 }
 
+func (h *Handler) buildTrustlineTransaction(c *gin.Context) {
+	var req TrustlineSetupRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	resp, err := h.service.BuildTrustlineTransaction(c.Request.Context(), req)
+	if err != nil {
+		if errors.Is(err, tokenization.ErrBuyerAccountNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 func (h *Handler) distributeRevenue(c *gin.Context) {
 	var req DistributeRevenueRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -320,6 +347,19 @@ func (h *Handler) getPayoutStatus(c *gin.Context) {
 	payout, err := h.service.GetPayoutStatus(c.Request.Context(), payoutID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, payout)
+}
+
+func (h *Handler) retryDistributionPayout(c *gin.Context) {
+	payoutID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return
+	}
+	payout, err := h.service.RetryDistributionPayout(c.Request.Context(), payoutID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, payout)
