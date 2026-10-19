@@ -1,12 +1,18 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
+import { env } from "../../config/env.js";
 import { anthropic, DEFAULT_MODEL } from "../../llm/client.js";
-import { auditLog } from "../../shared/audit/audit-log.service.js";
+import { classifyAnthropicError, ErrorCategory } from "../../llm/errors.js";
+import { runWithTokenBudget } from "../../llm/budget.js";
+import {
+  auditLog,
+  truncateToolOutput,
+} from "../../shared/audit/audit-log.service.js";
 import {
   ALERT_TRIAGE_ACTION_TYPES,
   checkApproval,
 } from "../../shared/guardrails/approval-gate.js";
+import { logger } from "../../shared/logging/logger.js";
 import type {
   AgentCitation,
   AgentRunRequest,
@@ -37,14 +43,10 @@ const AlertTriageOutputSchema = z.object({
 
 const outputFormat = betaZodOutputFormat(AlertTriageOutputSchema);
 
-// Bounds retries against a still-unimplemented get_monitoring_signals tool
-// (tracked separately) so a persistently failing tool call can't loop
-// forever.
-const MAX_ITERATIONS = 8;
-
 interface ToolCallRecord {
   name: string;
   input: unknown;
+  output: unknown;
 }
 
 export async function runAlertTriageAgent(
@@ -53,7 +55,7 @@ export async function runAlertTriageAgent(
   const runner = anthropic.beta.messages.toolRunner({
     model: DEFAULT_MODEL,
     max_tokens: 16000,
-    max_iterations: MAX_ITERATIONS,
+    max_iterations: env.agentMaxIterations,
     system: SYSTEM_PROMPT,
     tools: alertTriageTools,
     output_config: { format: outputFormat },
@@ -66,6 +68,21 @@ export async function runAlertTriageAgent(
   });
 
   function extractToolCalls(): ToolCallRecord[] {
+    // First pass: collect every tool_result content block from user turns,
+    // keyed by the tool_use_id they correspond to.
+    const resultsByUseId = new Map<string, unknown>();
+    for (const message of runner.params.messages) {
+      if (message.role !== "user" || typeof message.content === "string") {
+        continue;
+      }
+      for (const block of message.content) {
+        if (block.type === "tool_result") {
+          resultsByUseId.set(block.tool_use_id as string, block.content);
+        }
+      }
+    }
+
+    // Second pass: pair each tool_use block with its result.
     const calls: ToolCallRecord[] = [];
     for (const message of runner.params.messages) {
       if (message.role !== "assistant" || typeof message.content === "string") {
@@ -73,29 +90,56 @@ export async function runAlertTriageAgent(
       }
       for (const block of message.content) {
         if (block.type === "tool_use") {
-          calls.push({ name: block.name, input: block.input });
+          const rawOutput = resultsByUseId.get(block.id as string);
+          calls.push({
+            name: block.name,
+            input: block.input,
+            output: truncateToolOutput(rawOutput ?? null),
+          });
         }
       }
     }
     return calls;
   }
 
-  let finalMessage: Awaited<typeof runner>;
-  try {
-    finalMessage = await runner;
-  } catch (err) {
-    return failRun(req, extractToolCalls(), describeRunnerError(err));
+  const budgetResult = await runWithTokenBudget(runner, {
+    maxTokensPerRun: env.agentMaxTokensPerRun,
+  });
+  const { message: finalMessage, cumulativeTokens } = budgetResult;
+
+  if (budgetResult.error) {
+    const classified = classifyAnthropicError(
+      budgetResult.error,
+      "Alert-triage agent",
+    );
+    return failRun(
+      req,
+      extractToolCalls(),
+      classified.message,
+      cumulativeTokens,
+      classified,
+    );
+  }
+
+  if (budgetResult.budgetExceeded) {
+    return failRun(
+      req,
+      extractToolCalls(),
+      `Alert-triage agent aborted after exceeding its token budget (used ${cumulativeTokens} of ${env.agentMaxTokensPerRun} tokens).`,
+      cumulativeTokens,
+    );
   }
 
   const toolCalls = extractToolCalls();
 
   // Refusal-terminated turns may cut a tool_use off mid-input (see
   // BetaToolRunner), so there is no safe partial result to salvage here.
-  if (finalMessage.stop_reason === "refusal") {
+  if (!finalMessage || finalMessage.stop_reason === "refusal") {
     return failRun(
       req,
       toolCalls,
       "Anthropic declined to complete this alert-triage request.",
+      cumulativeTokens,
     );
   }
 
@@ -112,6 +156,7 @@ export async function runAlertTriageAgent(
       req,
       toolCalls,
       "Alert-triage agent finished without producing a text response.",
+      cumulativeTokens,
     );
   }
 
@@ -125,6 +170,7 @@ export async function runAlertTriageAgent(
       `Alert-triage agent returned output that could not be parsed: ${
         err instanceof Error ? err.message : String(err)
       }`,
+      cumulativeTokens,
     );
   }
 
@@ -155,6 +201,15 @@ export async function runAlertTriageAgent(
     toolCalls,
     status,
   });
+  logger.info(
+    {
+      agent: "alert-triage",
+      requestId: req.requestId,
+      status,
+      cumulativeTokens,
+    },
+    "agent run token usage",
+  );
 
   const citations: AgentCitation[] = parsed.citations;
 
@@ -170,26 +225,12 @@ export async function runAlertTriageAgent(
   };
 }
 
-// The tool runner already catches an individual tool's run() throwing and
-// feeds it back to the model as an is_error tool_result (see
-// generateToolResponse in @anthropic-ai/sdk's BetaToolRunner) — the model
-// gets a chance to recover or return a needs-more-data verdict. An error
-// only reaches here for a genuine Anthropic API failure (network, auth,
-// rate limit, 5xx) or something outside that per-tool recovery path, so
-// the two are distinguished by whether it is an Anthropic.APIError.
-function describeRunnerError(err: unknown): string {
-  if (err instanceof Anthropic.APIError) {
-    return `Anthropic API error: ${err.message}`;
-  }
-  return `Alert-triage agent tool execution failed: ${
-    err instanceof Error ? err.message : String(err)
-  }`;
-}
-
 async function failRun(
   req: AgentRunRequest,
   toolCalls: ToolCallRecord[],
   message: string,
+  cumulativeTokens: number,
+  errorInfo?: { category: ErrorCategory; retryable: boolean },
 ): Promise<AgentRunResult> {
   await auditLog.record({
     timestamp: new Date().toISOString(),
@@ -199,11 +240,22 @@ async function failRun(
     toolCalls,
     status: "failed",
   });
+  logger.info(
+    {
+      agent: "alert-triage",
+      requestId: req.requestId,
+      status: "failed",
+      cumulativeTokens,
+    },
+    "agent run token usage",
+  );
 
   return {
     agent: "alert-triage",
     requestId: req.requestId,
     status: "failed",
     output: { error: message },
+    errorCategory: errorInfo?.category,
+    retryable: errorInfo?.retryable,
   };
 }

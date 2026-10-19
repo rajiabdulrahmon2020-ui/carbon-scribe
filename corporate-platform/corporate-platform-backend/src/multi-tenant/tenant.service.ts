@@ -8,6 +8,7 @@ import { verify } from 'jsonwebtoken';
 import { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
 import { ApiKeyAuthContext } from '../api-key/interfaces/api-key.interface';
 import { TenantContext } from './interfaces/tenant-context.interface';
+import { ConfigService } from '../config/config.service';
 
 type TenantResolution = {
   tenant: TenantContext | null;
@@ -29,6 +30,8 @@ export class TenantService {
     /^\/api\/v1\/webhooks\/soroban$/,
     /^\/api\/v1\/webhooks\/transactions\/[^/]+\/status$/,
   ];
+
+  constructor(private readonly configService: ConfigService) {}
 
   resolveTenantFromRequest(request: Request): TenantResolution {
     // Use originalUrl to get the full path — request.path is relative to the
@@ -208,13 +211,24 @@ export class TenantService {
     }
 
     try {
-      const secret = process.env.JWT_SECRET || 'dev-jwt-secret';
-      const payload = verify(token, secret) as JwtPayload;
+      const authConfig = this.configService.getAuthConfig();
+      const secret = authConfig?.jwtSecret;
+      if (!secret) {
+        throw new UnauthorizedException('JWT secret is not configured');
+      }
+
+      const payload = verify(token, secret, {
+        algorithms: ['HS256'],
+      }) as JwtPayload;
+
       if (!payload?.companyId || !payload?.sub || !payload?.role) {
         throw new UnauthorizedException('Invalid JWT tenant context');
       }
       return payload;
-    } catch {
+    } catch (error) {
+      if (error instanceof UnauthorizedException) {
+        throw error;
+      }
       throw new UnauthorizedException('Invalid JWT');
     }
   }
