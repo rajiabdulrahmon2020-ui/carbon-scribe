@@ -23,6 +23,8 @@ import type { GeospatialSlice } from "./geospatial/geospatial.types";
 import { createGeospatialSlice } from "./geospatial/geospatialSlice";
 import type { ReportsSlice } from "./reports/reports.slice";
 import { createReportsSlice } from "./reports/reports.slice";
+import type { IntegrationSlice } from "./integrations/integration.types";
+import { createIntegrationSlice } from "./integrations/integrationSlice";
 
 // Unified store state type
 export type StoreState = AuthSlice &
@@ -33,7 +35,8 @@ export type StoreState = AuthSlice &
   NotificationsSlice &
   FinancingSlice &
   GeospatialSlice &
-  ReportsSlice;
+  ReportsSlice &
+  IntegrationSlice;
 
 // Helper to check if token is expired or about to expire (60s buffer)
 const isTokenExpiringSoon = (expiresIn: number | null): boolean => {
@@ -54,6 +57,7 @@ export const useStore = create<StoreState>()(
       ...createFinancingSlice(...args),
       ...createGeospatialSlice(...args),
       ...createReportsSlice(...args),
+      ...createIntegrationSlice(...args),
     }),
     {
       name: "project-portal-store-v2",

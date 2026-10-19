@@ -19,7 +19,6 @@ vendor/
 go.work
 
 # IDE specific files
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -120,8 +119,6 @@ web_modules/
 .yarn-integrity
 
 # dotenv environment variable files
-.env
-.env.*
 !.env.example
 
 # parcel-bundler cache (https://parceljs.org/)
@@ -138,7 +135,8 @@ dist
 
 # Gatsby files
 .cache/
-public
+# Only ignore a top-level Gatsby public/ build output, not nested public/ asset dirs
+/public
 
 # vuepress build output
 .vuepress/dist
@@ -190,3 +188,4 @@ public
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 ISSUE_CONTEXT.md
+config.bat
